@@ -15,7 +15,7 @@ public class DataProcessor {
 
     public static void main(String[] args) {
         if (args.length < 1) {
-            System.out.println("Please provide the file path as a command-line argument.");
+            System.out.println("Provide the file path as a command-line argument.");
             return;
         }
         String filePath = args[0];
@@ -39,12 +39,12 @@ public class DataProcessor {
                 "(id BIGINT AUTO_INCREMENT PRIMARY KEY, " +
                 " match_id BIGINT, " +
                 " market_id BIGINT, " +
-                " outcome_id BIGINT, " +
+                " outcome_id VARCHAR(255), " +
                 " specifiers VARCHAR(255), " +
                 " date_insert TIMESTAMP)";
         try (Statement stmt = conn.createStatement()) {
             stmt.execute(sql);
-            stmt.execute("CREATE INDEX idx_match_id ON events (match_id)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_match_id ON events (match_id)");
         }
     }
 
@@ -59,45 +59,48 @@ public class DataProcessor {
             int batchSize = 1000;
             long lineCount = 0;
             int sequenceNumber = 0;
+            int skippedLines = 0;
 
             // Skip the header line
             br.readLine();
 
             while ((line = br.readLine()) != null) {
+                lineCount++;
 
-                // Remove BOM if present
-                if (lineCount == 0 && line.startsWith("\uFEFF")) {
-                    line = line.substring(1);
-                }
+                String[] data = line.split("\\|", -1);
 
-                String[] data = line.split("\\|");
                 if (data.length < 4) {
-                    System.out.println("Skipping invalid line: " + line);
+                    System.out.println("Skipping invalid line " + lineCount + ": Insufficient fields");
+                    skippedLines++;
                     continue;
                 }
 
                 try {
-                    long matchId = Long.parseLong(data[0]);
+                    long matchId = parseId(data[0]);
+                    long marketId = Long.parseLong(data[1].trim());
+                    String outcomeId = parseOutcomeId(data[2]);
+                    String specifiers = data[3].trim();
+
                     Event event = new Event(
                             matchId,
-                            Long.parseLong(data[1]),
-                            Long.parseLong(data[2]),
-                            data[3],
+                            marketId,
+                            outcomeId,
+                            specifiers,
                             LocalDateTime.now(),
                             sequenceNumber++
                     );
                     eventQueues.computeIfAbsent(matchId, k -> new PriorityBlockingQueue<>()).add(event);
 
-                    if (lineCount % batchSize == 0 && lineCount > 0) {
+                    if (lineCount % batchSize == 0) {
                         processBatch(conn, pstmt, eventQueues);
                     }
 
-                    lineCount++;
                     if (lineCount % 10000 == 0) {
                         System.out.println("Processed " + lineCount + " lines");
                     }
-                } catch (NumberFormatException e) {
-                    System.out.println("Skipping line with invalid number format: " + line);
+                } catch (IllegalArgumentException e) {
+                    System.out.println("Skipping line " + lineCount + " with invalid format: " + line);
+                    skippedLines++;
                 }
             }
 
@@ -105,23 +108,45 @@ public class DataProcessor {
             processBatch(conn, pstmt, eventQueues);
 
             System.out.println("Total lines processed: " + lineCount);
+            System.out.println("Total lines skipped: " + skippedLines);
         }
     }
 
+    private static long parseId(String idString) {
+        // if present remove single quotes
+        idString = idString.replace("'", "");
+        int lastColonIndex = idString.lastIndexOf(':');
+        if (lastColonIndex != -1 && lastColonIndex < idString.length() - 1) {
+            String numericPart = idString.substring(lastColonIndex + 1);
+            return Long.parseLong(numericPart);
+        }
+        throw new IllegalArgumentException("Invalid ID format: " + idString);
+    }
+
+    private static String parseOutcomeId(String outcomeIdString) {
+        // Remove single quotes if present
+        return outcomeIdString.replace("'", "").trim();
+    }
+
+
+
     private static void processBatch(Connection conn, PreparedStatement pstmt, Map<Long, PriorityBlockingQueue<Event>> eventQueues) throws SQLException {
+        int insertedCount = 0;
         for (PriorityBlockingQueue<Event> queue : eventQueues.values()) {
             while (!queue.isEmpty()) {
                 Event event = queue.poll();
                 pstmt.setLong(1, event.getMatchId());
                 pstmt.setLong(2, event.getMarketId());
-                pstmt.setLong(3, event.getOutcomeId());
+                pstmt.setString(3, event.getOutcomeId());
                 pstmt.setString(4, event.getSpecifiers());
                 pstmt.setTimestamp(5, Timestamp.valueOf(event.getDateInsert()));
                 pstmt.addBatch();
+                insertedCount++;
             }
         }
-        pstmt.executeBatch();
+        int[] updateCounts = pstmt.executeBatch();
         conn.commit();
+        System.out.println("Inserted " + insertedCount + " events in this batch");
     }
 
     private static void printDateInsertRange(Connection conn) throws SQLException {
@@ -140,11 +165,14 @@ public class DataProcessor {
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
             System.out.println("\nSample data:");
+            System.out.println("ID | Match ID | Market ID | Outcome ID | Specifiers | Date Insert");
+            System.out.println("-------------------------------------------------------------------");
             while (rs.next()) {
-                System.out.printf("Match ID: %d, Market ID: %d, Outcome ID: %d, Specifiers: %s, Date Insert: %s%n",
+                System.out.printf("%d | %d | %d | %s | %s | %s%n",
+                        rs.getLong("id"),
                         rs.getLong("match_id"),
                         rs.getLong("market_id"),
-                        rs.getLong("outcome_id"),
+                        rs.getString("outcome_id"),  // Changed from getLong to getString
                         rs.getString("specifiers"),
                         rs.getTimestamp("date_insert")
                 );
@@ -153,24 +181,26 @@ public class DataProcessor {
     }
 
     private static void checkDataInDB(Connection conn) throws SQLException {
-        String sql = "SELECT * FROM events ORDER BY match_id, id LIMIT 20";
+        // Display sample data
+        String sampleSql = "SELECT * FROM events ORDER BY match_id, id LIMIT 20";
         try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
-            System.out.println("\nSample data from database:");
+             ResultSet rs = stmt.executeQuery(sampleSql)) {
+            System.out.println("\nSample data from database (first 20 rows):");
             System.out.println("ID | Match ID | Market ID | Outcome ID | Specifiers | Date Insert");
             System.out.println("-------------------------------------------------------------------");
             while (rs.next()) {
-                System.out.printf("%d | %d | %d | %d | %s | %s%n",
+                System.out.printf("%d | %d | %d | %s | %s | %s%n",
                         rs.getLong("id"),
                         rs.getLong("match_id"),
                         rs.getLong("market_id"),
-                        rs.getLong("outcome_id"),
+                        rs.getString("outcome_id"),  // Changed from getLong to getString
                         rs.getString("specifiers"),
                         rs.getTimestamp("date_insert")
                 );
             }
         }
 
+        // Count total records
         String countSql = "SELECT COUNT(*) as total FROM events";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(countSql)) {
@@ -178,15 +208,42 @@ public class DataProcessor {
                 System.out.println("\nTotal number of records: " + rs.getLong("total"));
             }
         }
+
+        // Get statistics
+        String statsSql = "SELECT COUNT(DISTINCT match_id) as unique_matches, " +
+                "MIN(date_insert) as min_date, MAX(date_insert) as max_date " +
+                "FROM events";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(statsSql)) {
+            if (rs.next()) {
+                System.out.println("Number of unique matches: " + rs.getLong("unique_matches"));
+                System.out.println("Earliest insert date: " + rs.getTimestamp("min_date"));
+                System.out.println("Latest insert date: " + rs.getTimestamp("max_date"));
+            }
+        }
+
+        // Get top 5 matches by number of events
+        String topMatchesSql = "SELECT match_id, COUNT(*) as event_count " +
+                "FROM events GROUP BY match_id ORDER BY event_count DESC LIMIT 5";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(topMatchesSql)) {
+            System.out.println("\nTop 5 matches by number of events:");
+            System.out.println("Match ID | Event Count");
+            System.out.println("----------------------");
+            while (rs.next()) {
+                System.out.printf("%d | %d%n", rs.getLong("match_id"), rs.getLong("event_count"));
+            }
+        }
     }
 
     static class Event implements Comparable<Event> {
-        private final long matchId, marketId, outcomeId;
+        private final long matchId, marketId;
+        private final String outcomeId;
         private final String specifiers;
         private final LocalDateTime dateInsert;
         private final int sequenceNumber;
 
-        public Event(long matchId, long marketId, long outcomeId, String specifiers, LocalDateTime dateInsert, int sequenceNumber) {
+        public Event(long matchId, long marketId, String outcomeId, String specifiers, LocalDateTime dateInsert, int sequenceNumber) {
             this.matchId = matchId;
             this.marketId = marketId;
             this.outcomeId = outcomeId;
@@ -195,15 +252,33 @@ public class DataProcessor {
             this.sequenceNumber = sequenceNumber;
         }
 
-        public long getMatchId() { return matchId; }
-        public long getMarketId() { return marketId; }
-        public long getOutcomeId() { return outcomeId; }
-        public String getSpecifiers() { return specifiers; }
-        public LocalDateTime getDateInsert() { return dateInsert; }
-
         @Override
         public int compareTo(Event other) {
             return Integer.compare(this.sequenceNumber, other.sequenceNumber);
+        }
+
+        public long getMatchId() {
+            return matchId;
+        }
+
+        public long getMarketId() {
+            return marketId;
+        }
+
+        public String getOutcomeId() {
+            return outcomeId;
+        }
+
+        public String getSpecifiers() {
+            return specifiers;
+        }
+
+        public LocalDateTime getDateInsert() {
+            return dateInsert;
+        }
+
+        public int getSequenceNumber() {
+            return sequenceNumber;
         }
     }
 }
